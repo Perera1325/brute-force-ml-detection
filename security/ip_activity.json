@@ -1,6 +1,10 @@
 {
-    "192.168.1.100": {
-        "total_requests": 1,
-        "attack_count": 1
+    "192.168.1.50": {
+        "timestamps": [
+            "2026-02-21T09:51:42.061515",
+            "2026-02-21T09:51:42.093509"
+        ],
+        "attack_count": 1,
+        "banned_until": null
     }
 }
