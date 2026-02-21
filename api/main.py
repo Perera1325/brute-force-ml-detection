@@ -4,21 +4,28 @@ import joblib
 import os
 import datetime
 import json
+from collections import deque
 
 # ==============================
 # App Setup
 # ==============================
 
-app = FastAPI(
-    title="AI Brute Force Detection API",
-    version="2.0"
-)
+app = FastAPI(title="AI Intrusion Detection API", version="3.0")
 
 MODEL_PATH = "../model/brute_force_model.pkl"
 BLACKLIST_PATH = "../security/blacklist.json"
 IP_ACTIVITY_PATH = "../security/ip_activity.json"
 
 os.makedirs("../security", exist_ok=True)
+
+# ==============================
+# Configuration
+# ==============================
+
+TIME_WINDOW_SECONDS = 60
+MAX_REQUESTS_PER_WINDOW = 10
+BLACKLIST_LIMIT = 5
+TEMP_BAN_MINUTES = 2
 
 # ==============================
 # Load Model
@@ -28,7 +35,6 @@ try:
     model = joblib.load(MODEL_PATH)
 except:
     model = None
-
 
 # ==============================
 # Schema
@@ -41,9 +47,8 @@ class LoginAttempt(BaseModel):
     login_success: int
     ip_attempts: int
 
-
 # ==============================
-# Utility Functions
+# Utility
 # ==============================
 
 def load_json(path):
@@ -52,35 +57,38 @@ def load_json(path):
     with open(path, "r") as f:
         return json.load(f)
 
-
 def save_json(path, data):
     with open(path, "w") as f:
         json.dump(data, f, indent=4)
 
-
-def calculate_risk_score(prob):
-    return round(prob * 100, 2)
-
+def calculate_risk_score(ml_probability, request_rate, failure_ratio):
+    score = (ml_probability * 0.6) + (request_rate * 0.2) + (failure_ratio * 0.2)
+    return round(score * 100, 2)
 
 # ==============================
-# Campaign Detection Logic
+# Rate Limiting + Time Window
 # ==============================
-
-ATTACK_THRESHOLD = 3
-BLACKLIST_LIMIT = 5
-
 
 def update_ip_activity(ip, attack_detected):
 
     ip_data = load_json(IP_ACTIVITY_PATH)
+    now = datetime.datetime.now()
 
     if ip not in ip_data:
         ip_data[ip] = {
-            "total_requests": 0,
-            "attack_count": 0
+            "timestamps": [],
+            "attack_count": 0,
+            "banned_until": None
         }
 
-    ip_data[ip]["total_requests"] += 1
+    # Remove old timestamps outside window
+    ip_data[ip]["timestamps"] = [
+        t for t in ip_data[ip]["timestamps"]
+        if (now - datetime.datetime.fromisoformat(t)).seconds <= TIME_WINDOW_SECONDS
+    ]
+
+    # Add current timestamp
+    ip_data[ip]["timestamps"].append(now.isoformat())
 
     if attack_detected:
         ip_data[ip]["attack_count"] += 1
@@ -89,42 +97,42 @@ def update_ip_activity(ip, attack_detected):
 
     return ip_data[ip]
 
+# ==============================
+# Blacklist + Temp Ban
+# ==============================
 
-def check_and_blacklist(ip, attack_count):
+def check_blacklist(ip_data, ip):
 
+    now = datetime.datetime.now()
+
+    # Check temp ban
+    if ip_data["banned_until"]:
+        banned_until = datetime.datetime.fromisoformat(ip_data["banned_until"])
+        if now < banned_until:
+            return "TEMP_BANNED"
+
+    # Permanent blacklist
     blacklist = load_json(BLACKLIST_PATH)
+    if ip in blacklist:
+        return "BLACKLISTED"
 
-    if attack_count >= BLACKLIST_LIMIT:
-        blacklist[ip] = {
-            "blacklisted_at": str(datetime.datetime.now()),
-            "reason": "Multiple brute force attempts"
-        }
+    return None
 
-        save_json(BLACKLIST_PATH, blacklist)
-        return True
 
-    return False
+def apply_temp_ban(ip):
 
+    ip_data = load_json(IP_ACTIVITY_PATH)
+    now = datetime.datetime.now()
+
+    ip_data[ip]["banned_until"] = (
+        now + datetime.timedelta(minutes=TEMP_BAN_MINUTES)
+    ).isoformat()
+
+    save_json(IP_ACTIVITY_PATH, ip_data)
 
 # ==============================
 # Routes
 # ==============================
-
-@app.get("/")
-def home():
-    return {"status": "running", "version": "2.0"}
-
-
-@app.get("/blacklist")
-def view_blacklist():
-    return load_json(BLACKLIST_PATH)
-
-
-@app.post("/clear_blacklist")
-def clear_blacklist():
-    save_json(BLACKLIST_PATH, {})
-    return {"message": "Blacklist cleared"}
-
 
 @app.post("/predict")
 def predict(login: LoginAttempt):
@@ -132,13 +140,11 @@ def predict(login: LoginAttempt):
     if not model:
         raise HTTPException(status_code=500, detail="Model not loaded")
 
-    blacklist = load_json(BLACKLIST_PATH)
+    ip_data = update_ip_activity(login.ip_address, False)
 
-    if login.ip_address in blacklist:
-        return {
-            "prediction": "BLOCKED",
-            "reason": "IP is blacklisted"
-        }
+    blacklist_status = check_blacklist(ip_data, login.ip_address)
+    if blacklist_status:
+        return {"status": blacklist_status}
 
     features = [[
         login.failed_attempts,
@@ -148,26 +154,33 @@ def predict(login: LoginAttempt):
     ]]
 
     prediction = model.predict(features)[0]
-    probability = model.predict_proba(features)[0][1]
-    risk_score = calculate_risk_score(probability)
+    ml_prob = model.predict_proba(features)[0][1]
 
     attack_detected = True if prediction == 1 else False
 
-    ip_stats = update_ip_activity(login.ip_address, attack_detected)
+    ip_data = update_ip_activity(login.ip_address, attack_detected)
 
-    blacklisted = check_and_blacklist(
-        login.ip_address,
-        ip_stats["attack_count"]
-    )
+    request_rate = min(len(ip_data["timestamps"]) / MAX_REQUESTS_PER_WINDOW, 1)
+    failure_ratio = min(login.failed_attempts / 20, 1)
 
-    if blacklisted:
+    risk_score = calculate_risk_score(ml_prob, request_rate, failure_ratio)
+
+    # Automatic temp ban
+    if request_rate >= 1 or ip_data["attack_count"] >= BLACKLIST_LIMIT:
+        apply_temp_ban(login.ip_address)
         return {
-            "prediction": "BLACKLISTED",
-            "message": "IP automatically blacklisted due to repeated attacks"
+            "status": "TEMP_BANNED",
+            "reason": "Too many requests or repeated attacks"
         }
 
     return {
         "prediction": "ATTACK" if attack_detected else "NORMAL",
         "risk_score_percent": risk_score,
-        "ip_statistics": ip_stats
+        "requests_in_window": len(ip_data["timestamps"]),
+        "attack_count": ip_data["attack_count"]
     }
+
+
+@app.get("/blacklist")
+def view_blacklist():
+    return load_json(BLACKLIST_PATH)
