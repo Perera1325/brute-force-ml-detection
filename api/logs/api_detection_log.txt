@@ -1,0 +1,1 @@
+2026-02-21 09:38:59.733703 | Data: {'failed_attempts': 15, 'time_between_attempts': 0.5, 'login_success': 0, 'ip_attempts': 30} | Prediction: ATTACK | Risk Score: 100.0%
